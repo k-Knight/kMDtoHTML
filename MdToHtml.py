@@ -1,7 +1,10 @@
 import os, fnmatch
 import argparse
+import bs4
+import codecs
 from markdown import markdown
 from bs4 import BeautifulSoup
+from types import SimpleNamespace
 
 def find_files(pattern, dir):
     result = []
@@ -12,16 +15,39 @@ def find_files(pattern, dir):
     return result
 
 def get_file_content(file_name):
-    file = open(file_name, "r")
+    file = codecs.open(file_name, "r", "utf-8")
     content = file.read()
     file.close()
 
     return content
 
 def write_obj_to_file(file_name, obj):
-    file = open(file_name, "w")
+    file = codecs.open(file_name, "w", "utf-8")
     file.write(str(obj))
     file.close()
+
+def elem_to_str(element, before = ""):
+    res = before + str(element)
+    res = res.replace("\n", "")
+    if len(res) > 153:
+        res = res[:150] + "..."
+
+    return res
+
+class Section:
+    def __init__(self, element, content, level = 7):
+        self.element = element
+        self.content = content
+        self.level = level
+
+    def __str__(self, before = ""):
+        result = elem_to_str(self.element, before) + "\n"
+
+        for child in self.content:
+            result += child.__str__(before + "| ")
+
+        return result
+
 
 class MDHtml:
     def __init__(self, file_name, args):
@@ -36,7 +62,12 @@ class MDHtml:
             print("WARNING: Failed to load file: " + self.file_name)
             return
 
-        self.md_html = BeautifulSoup(markdown(md_text), "html.parser")
+        if self.args.verbose:
+            print("INFO: Convertion started for  " + self.file_name)
+
+        md_extensions = ['extra', 'admonition', 'codehilite']
+        self.md_html = BeautifulSoup(markdown(md_text, extensions=md_extensions), "html.parser")
+        self.preprocess_symbols()
         self.title = self.md_html.find_all()[0]
 
         html = BeautifulSoup("<!DOCTYPE html>\n<html></html>", "html.parser")
@@ -47,8 +78,66 @@ class MDHtml:
 
         self.conditional_processing()
 
+        if self.args.semantic:
+            article = self.soup.new_tag("article")
+            self.container.append(article)
+            self.container = article
+
         self.container.append(self.md_html)
         return html
+
+    def preprocess_symbols(self):
+        strings = self.find_strings_to_preprocess()
+
+        for string in strings:
+            processed_string = str(string)
+
+            processed_string = self.replace_dashes(processed_string)
+
+            string.replace_with(BeautifulSoup(processed_string, "html.parser"))
+
+    def find_strings_to_preprocess(self):
+        strings = []
+        elem_stack = []
+        for element in self.md_html.find_all(True, recursive=False):
+            elem_stack.append(SimpleNamespace(tag = element, inside_text = False))
+
+        while len(elem_stack) > 0:
+            element = elem_stack.pop()
+            self.set_element_flags(element)
+
+            for child in element.tag.contents:
+                if element.string_extraction_allowed and type(child) == bs4.element.NavigableString:
+                    strings.append(child)
+
+                if element.children_extraction_allowed and type(child) == bs4.element.Tag:
+                    elem_stack.append(SimpleNamespace(tag = child, inside_text = element.is_text))
+
+        return strings
+
+    def set_element_flags(self, element):
+        element.is_text = element.tag.name in [
+            "p", "figcaption", "blockquote",
+            "caption", "cite", "dt", "dd", "del",
+            "ins", "details", "dfn", "summary",
+            "h1", "h2", "h3", "h4", "h5", "h6",
+            "li", "mark", "q", "s", "sub", "sup",
+            "td", "th", "var"
+            ]
+
+        element.children_extraction_allowed = not element.tag.name in ["code", "pre", "kbd", "samp"]
+
+        element.string_extraction_allowed = element.is_text or (
+                element.inside_text and
+                element.tag.name in ["strong", "em", "span", "b", "i", "span", "u"] and
+                element.children_extraction_allowed
+            )
+
+    def replace_dashes(self, string):
+        string = string.replace("---", "&mdash;")
+        string = string.replace("--", "&ndash;")
+
+        return string
 
     def conditional_processing(self):
         if self.args.r:
@@ -59,8 +148,18 @@ class MDHtml:
         if self.args.l:
             self.add_heading_links()
 
-        if self.args.t != None:
-            self.container.append(self.create_table_of_contents())
+        if self.args.t != None or self.args.semantic:
+            self.define_md_structure()
+
+            if self.args.verbose:
+                print("\n" + 153 * "=" + "\n" + 71 * "=" + " HIERARCHY " + 71 * "=" + "\n" + 153 * "=" + "\n")
+                for section in self.hierarchy: print(section)
+
+            if self.args.t != None:
+                self.container.append(self.create_table_of_contents())
+
+            if self.args.semantic:
+                self.semantic_restructure()
 
         if self.args.n:
             self.apply_numbering()
@@ -113,8 +212,8 @@ class MDHtml:
         container.append(md_container)
 
         if self.args.header:
-            header = self.soup.new_tag("div", id="header")
-            title = self.soup.new_tag("span")
+            header = self.soup.new_tag("div" if not self.args.semantic else "header", id="header")
+            title = self.soup.new_tag("span" if not self.args.semantic else "h1")
             title.string = self.title.string
             header.append(title)
             md_container.append(header)
@@ -150,7 +249,7 @@ class MDHtml:
             if i < level:
                 res += str(numbering[i]) + "."
             else:
-                res += " "
+                res = res[:-1]
                 return res
 
     def update_numbering(self, numbering, level):
@@ -187,6 +286,49 @@ class MDHtml:
 
         return res
 
+    def define_md_structure(self):
+        self.hierarchy = []
+        section_stack = [None, None, None, None, None, None]
+
+        for element in self.md_html.find_all(True, recursive=False):
+            elem_level = self.get_heading_level(element.name)
+            elem_level = elem_level - self.min_level + 1
+
+            if elem_level < 7:
+                section = Section(element, [], elem_level)
+                self.append_section_to_hierarchy(section, section_stack)
+
+                for i in range(elem_level, 6):
+                    section_stack[i] = None
+            else:
+                for i in range(len(section_stack) -1, -1, -1):
+                    if section_stack[i] != None:
+                        section_stack[i].content.append(Section(element, []))
+                        break
+                    elif i == 0:
+                        self.hierarchy.append(Section(element, []))
+
+    def append_section_to_hierarchy(self, section, section_stack):
+        if section.level == 1:
+            self.hierarchy.append(section)
+            section_stack[0] = section
+        else:
+            append_stack = [section]
+            for i in range(section.level - 2, -1 , -1):
+                if section_stack[i] == None:
+                    append_stack.append(Section(None, [], i + 1))
+                else:
+                    break
+
+            while len(append_stack) > 0:
+                append_section = append_stack.pop()
+                section_stack[append_section.level - 1] = append_section
+
+                if append_section.level == 1:
+                    self.hierarchy.append(append_section)
+                else:
+                    section_stack[append_section.level - 2].content.append(append_section)
+
     def create_table_of_contents(self):
         try:
             level = int(self.args.t)
@@ -200,7 +342,7 @@ class MDHtml:
 
         self.build_toc(level)
 
-        contaier = self.soup.new_tag("div", id="toc")
+        contaier = self.soup.new_tag("div" if not self.args.semantic else "section", id="toc")
         toc_title = self.soup.new_tag("h1")
         toc_title.string = self.args.toc_title
 
@@ -211,89 +353,55 @@ class MDHtml:
 
     def build_toc(self, level):
         self.toc = self.soup.new_tag("ol")
+        section_stack = [SimpleNamespace(
+            element  = self.toc,
+            children = self.hierarchy,
+            level    = 0,
+            parent   = None
+        )]
 
-        self.hierarchy = [None, None, None, None, None]
-        for element in self.md_html.find_all():
-            elem_level = self.get_heading_level(element.name)
-            elem_level = elem_level - self.min_level + 1
+        while len(section_stack) > 0:
+            element = section_stack.pop()
 
-            if elem_level <= level:
-                item = self.create_toc_item(element)
-                parent, difference = self.get_parent_heading(elem_level)
+            if element.level <= level:
+                if element.level > 0:
+                    item = self.create_toc_item(element)
+                    parent = SimpleNamespace(element = item.find("div"), level = element.level)
+                    self.define_item_container(element.parent.element, element.level).append(item)
+                else:
+                    parent = SimpleNamespace(element = element.element, level = element.level)
 
-                if level < 6:
-                    self.hierarchy[elem_level - 1] = item
+                for i in range(len(element.children) - 1, -1, -1):
+                    section_stack.append(SimpleNamespace(
+                        element  = element.children[i].element,
+                        children = element.children[i].content,
+                        level    = element.children[i].level,
+                        parent   = parent
+                    ))
 
-                contaier = self.create_item_container(item, parent, difference, elem_level)
-                contaier.append(item)
-
-    def create_toc_item(self, element):
+    def create_toc_item(self, section):
         item = self.soup.new_tag("li")
+        index = next((i for i, t in enumerate(self.numbering) if t[0] == section.element), None)
+
+        if index != None:
+            if self.args.toc_number:
+                num = self.soup.new_tag("span", attrs={"class": "toc-number"})
+                num.string = self.numbering[index][1]
+                item.append(num)
+
+            if self.args.l:
+                elem_num = self.numbering[index]
+                element = self.soup.new_tag("a", href="#" + self.generate_id(elem_num[1] + elem_num[0].string))
+        else:
+            element =  self.soup.new_tag("span")
+
         container = self.soup.new_tag("div")
         item.append(container)
-
-        if self.args.l:
-            index = next((i for i, t in enumerate(self.numbering) if t[0] == element), None)
-            if index != None:
-                elem_num = self.numbering[index]
-                link = self.soup.new_tag("a", href="#" + self.generate_id(elem_num[1] + elem_num[0].string))
-                container.append(link)
-                container = link
-            else:
-                text =  self.soup.new_tag("p")
-                container.append(text)
-                container = text
-
-        if element != None:
-            container.string = element.string
+        container.append(element)
+        container = element
+        container.string = section.element.string if section.element != None else ""
 
         return item
-
-    def get_parent_heading(self, elem_level):
-        parent = None
-        difference = 0
-
-        if elem_level > 1:
-            parent = self.hierarchy[elem_level - 2]
-
-        if parent == None and elem_level > 1:
-            parent, difference = self.get_nearest_parent(elem_level)
-
-        if parent == None:
-            parent = self.toc
-        else:
-            parent = parent.find("div")
-
-        for i in range(elem_level, 4):
-            self.hierarchy[i] = None
-
-        return parent, difference
-
-    def get_nearest_parent(self, elem_level):
-        parent = None
-        difference = 0
-
-        for i in range(2, 6):
-            if elem_level >= i:
-                difference += 1
-                if self.hierarchy[elem_level - i] != None:
-                    parent = self.hierarchy[elem_level - i]
-                    break
-
-        return parent, difference
-
-    def create_item_container(self, item, parent, difference, elem_level):
-        if difference > 0:
-            for i in range (0, difference):
-                contaier = self.define_item_container(item, elem_level - difference + i)
-                contaier['start'] = 0
-                parent = self.create_toc_item(None)
-                contaier.append(parent)
-                self.hierarchy[elem_level - difference + i - 1] = parent
-        else:
-            contaier = self.define_item_container(parent, elem_level)
-
-        return contaier
 
     def define_item_container(self, parent, level):
         contaier = parent.find("ol")
@@ -306,9 +414,50 @@ class MDHtml:
 
         return contaier
 
+    def semantic_restructure(self):
+        semantic_html = BeautifulSoup("", "html.parser")
+        section_stack = []
+
+        for section_l1 in self.hierarchy:
+            section_stack.append([section_l1, 0, semantic_html, None])
+            while len(section_stack) > 0:
+                section_element = section_stack[-1]
+
+                if section_element[3] == None:
+                    if section_element[0].level < 7:
+                        section = self.soup.new_tag("section")
+                        if section_element[0].element != None:
+                            section.append(section_element[0].element)
+                        section_element[3] = section
+                        section_element[2].append(section)
+                    else:
+                        section_element[2].append(section_element[0].element)
+
+                while True:
+                    if section_element[1] >= len(section_element[0].content):
+                        section_stack.pop()
+                        break
+
+                    content_element = section_element[0].content[section_element[1]]
+                    section_element[1] += 1
+
+                    if content_element.level < 7:
+                        section_stack.append([content_element, 0, section_element[3], None])
+                        break
+                    else:
+                        section_element[3].append(content_element.element)
+
+        self.md_html = semantic_html
+
     def apply_numbering(self):
         for elem_num in self.numbering:
-            elem_num[0].string = elem_num[1] + elem_num[0].string
+            elem_string = elem_num[0].string
+            elem_num[0].string = ""
+
+            num = self.soup.new_tag("span", attrs={"class": "heading-number"})
+            num.string = elem_num[1]
+            elem_num[0].append(num)
+            elem_num[0].append(elem_string)
 
 class Converter:
     def __init__(self, args):
@@ -341,7 +490,10 @@ def main():
     parser.add_argument('--directory', type=str, help="specify a directory that is searched recursively for Markdown (.md) files to be converted to html")
     parser.add_argument('--style', type=str, help="specify a directory that is searched recursively for .css and .js files to be embeded in resulting html")
     parser.add_argument('--toc-title', type=str, help="specify a title for table of contents, title is \"Table of Contents\" by default, takes effect only when -t parameter is specified")
+    parser.add_argument('--toc-number', action='store_true', help="generate numbering for elements of table of contents")
     parser.add_argument('--header', action='store_true', help="add header to resulting html's body, header contains title")
+    parser.add_argument('--semantic', action='store_true', help="use semantic html elements")
+    parser.add_argument('--verbose', action='store_true', help="print debug infromation")
     parser.add_argument('-r', action='store_true', help="remove first element of the Markdown (always used as a title)")
     parser.add_argument('-n', action='store_true', help="enumerate headings")
     parser.add_argument('-l', action='store_true', help="add an unique id to each heading to be referenceable")
